@@ -4,3 +4,4 @@ uploads/
 server.log
 __pycache__/
 *.pyc
+access.log
