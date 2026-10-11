@@ -366,4 +366,9 @@ def uploaded(fname):
     return send_from_directory(UPLOAD, fname)
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=8080, debug=False)
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--host", default="0.0.0.0")
+    ap.add_argument("--port", type=int, default=8080)
+    args = ap.parse_args()
+    app.run(host=args.host, port=args.port, debug=False)
