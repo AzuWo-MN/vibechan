@@ -17,8 +17,58 @@ sys.path.insert(0, BASE)
 from templates import TPL_HOME, TPL_BOARD, TPL_THREAD, TPL_LOGIN, TPL_ADMIN
 
 app = Flask(__name__)
-app.secret_key = os.environ.get("SECRET_KEY") or secrets.token_hex(32)
+# Persistent secret: stored in instance/secret_key so sessions & bans survive restarts
+SECRET_FILE = os.path.join(BASE, "instance", "secret_key")
+if os.environ.get("SECRET_KEY"):
+    app.secret_key = os.environ["SECRET_KEY"]
+elif os.path.exists(SECRET_FILE):
+    app.secret_key = open(SECRET_FILE, "rb").read()
+else:
+    _sk = secrets.token_bytes(32)
+    with open(SECRET_FILE, "wb") as f:
+        f.write(_sk)
+    os.chmod(SECRET_FILE, 0o600)
+    app.secret_key = _sk
 app.config["MAX_CONTENT_LENGTH"] = 8 * 1024 * 1024  # 8MB uploads
+
+# ---- security headers on every response
+@app.after_request
+def security_headers(resp):
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    resp.headers["X-Frame-Options"] = "DENY"
+    resp.headers["Referrer-Policy"] = "same-origin"
+    resp.headers["Content-Security-Policy"] = (
+        "default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'none'")
+    if request.path.startswith("/uploads/"):
+        resp.headers["Content-Disposition"] = "attachment"
+    return resp
+
+# ---------------------------------------------------------------- simple rate limiter (in-memory, per-IP)
+import threading
+_rate_lock = threading.Lock()
+_rate_buckets: dict = {}
+
+def rate_limit(kind: str, limit: int, window_s: int):
+    """Sliding-window per-IP+kind limiter. Returns None if allowed, else seconds to wait."""
+    now_i = int(time.time())
+    key = f"{kind}:{ip_hash()}"
+    with _rate_lock:
+        hits = [t for t in _rate_buckets.get(key, []) if now_i - t < window_s]
+        if len(hits) >= limit:
+            return window_s - (now_i - hits[0])
+        hits.append(now_i)
+        _rate_buckets[key] = hits
+        if len(_rate_buckets) > 10000:
+            cutoff = now_i - 3600
+            for k in list(_rate_buckets):
+                if not _rate_buckets[k] or _rate_buckets[k][-1] < cutoff:
+                    del _rate_buckets[k]
+    return None
+
+def limited(kind, limit, window_s):
+    wait = rate_limit(kind, limit, window_s)
+    if wait is not None:
+        abort(429, f"Rate limited. Try again in {int(wait)+1}s.")
 
 ALLOWED_EXT = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
 ALLOWED_BOARDS = set("abcdefghijklmnopqrstuvwxyz0123456789")
@@ -43,6 +93,7 @@ CREATE TABLE IF NOT EXISTS threads (
   locked INTEGER DEFAULT 0,
   hidden INTEGER DEFAULT 0,
   report_count INTEGER DEFAULT 0,
+  ip_hash TEXT,
   created_at INTEGER,
   bumped_at INTEGER
 );
@@ -53,6 +104,7 @@ CREATE TABLE IF NOT EXISTS posts (
   body TEXT NOT NULL,
   image TEXT,
   report_count INTEGER DEFAULT 0,
+  ip_hash TEXT,
   hidden INTEGER DEFAULT 0,
   created_at INTEGER
 );
@@ -95,8 +147,9 @@ def init():
                      (slug, name, desc, int(time.time())))
     # default admin: admin / changeme  (change immediately!)
     if not conn.execute("SELECT 1 FROM admins").fetchone():
+        from werkzeug.security import generate_password_hash
         conn.execute("INSERT INTO admins VALUES(?,?)",
-                     ("admin", hashlib.sha256(b"changeme").hexdigest()))
+                     ("admin", generate_password_hash("changeme")))
     conn.commit(); conn.close()
 
 init()
@@ -130,7 +183,6 @@ def is_banned():
     row = conn.execute("SELECT 1 FROM bans WHERE ip_hash=? LIMIT 1", (ip_hash(),)).fetchone()
     conn.close()
     return bool(row)
-
 def login_required(f):
     @wraps(f)
     def wrapped(*a, **kw):
@@ -155,7 +207,23 @@ def save_image(fileobj):
     if ext not in ALLOWED_EXT:
         abort(400, "Unsupported file type")
     fname = f"{int(time.time()*1000)}_{secrets.token_hex(4)}{ext}"
-    fileobj.save(os.path.join(UPLOAD, fname))
+    path = os.path.join(UPLOAD, fname)
+    fileobj.save(path)
+    # --- hardening: verify magic bytes, strip EXIF by re-encoding raster formats
+    from PIL import Image
+    try:
+        img = Image.open(path)
+        fmt = (img.format or "").upper()
+        expected = {".png": "PNG", ".jpg": "JPEG", ".jpeg": "JPEG", ".gif": "GIF", ".webp": "WEBP"}
+        if fmt != expected.get(ext):
+            os.remove(path)
+            abort(400, "File content does not match its extension")
+        if fmt != "GIF":  # preserve animation; re-encode everything else (strips EXIF/payloads)
+            img = img.convert("RGB") if fmt == "JPEG" else img
+            img.save(path)
+    except Image.UnidentifiedImageError:
+        os.remove(path)
+        abort(400, "Not a valid image")
     return fname
 
 # ---------------------------------------------------------------- template helpers
@@ -216,16 +284,20 @@ def new_thread(slug):
     b = get_board(slug)
     if not b or b["hidden"] or is_banned():
         abort(403)
+    limited("thread", 3, 600)      # 3 threads / 10 min
+    limited("post", 10, 60)        # 10 posts / min
     body = request.form.get("body", "").strip()
     if not body:
         abort(400, "Empty post")
+    if len(body) > 4000:
+        abort(400, "Post too long")
     conn = db()
     t = now()
     cur = conn.execute(
-        "INSERT INTO threads(board,subject,author,body,image,created_at,bumped_at) VALUES(?,?,?,?,?,?,?)",
+        "INSERT INTO threads(board,subject,author,body,image,ip_hash,created_at,bumped_at) VALUES(?,?,?,?,?,?,?,?)",
         (slug, request.form.get("subject", "").strip()[:100],
          request.form.get("author", "").strip()[:30] or "Anonymous",
-         body[:4000], save_image(request.files.get("image")), t, t))
+         body[:4000], save_image(request.files.get("image")), ip_hash(), t, t))
     conn.commit(); conn.close()
     return redirect(f"/{slug}/thread/{cur.lastrowid}")
 
@@ -233,13 +305,20 @@ def new_thread(slug):
 def reply(slug, tid):
     if is_banned():
         abort(403)
+    limited("post", 10, 60)
     body = request.form.get("body", "").strip()
     if not body:
         abort(400, "Empty post")
+    if len(body) > 4000:
+        abort(400, "Post too long")
     conn = db()
-    conn.execute("INSERT INTO posts(thread_id,author,body,image,created_at) VALUES(?,?,?,?,?)",
+    if not conn.execute("SELECT 1 FROM threads WHERE id=? AND board=? AND locked=0 AND hidden=0",
+                        (tid, slug)).fetchone():
+        conn.close()
+        abort(404 if not conn.execute("SELECT 1 FROM threads WHERE id=? AND board=?", (tid, slug)).fetchone() else 403)
+    conn.execute("INSERT INTO posts(thread_id,author,body,image,ip_hash,created_at) VALUES(?,?,?,?,?,?)",
                  (tid, request.form.get("author", "").strip()[:30] or "Anonymous",
-                  body[:4000], save_image(request.files.get("image")), now()))
+                  body[:4000], save_image(request.files.get("image")), ip_hash(), now()))
     conn.execute("UPDATE threads SET bumped_at=? WHERE id=?", (now(), tid))
     conn.commit(); conn.close()
     return redirect(f"/{slug}/thread/{tid}")
@@ -247,6 +326,7 @@ def reply(slug, tid):
 @app.route("/<slug>/thread/<int:tid>/report", methods=["POST"])
 @app.route("/post/<int:pid>/report", methods=["POST"])
 def report(slug=None, tid=None, pid=None):
+    limited("report", 10, 3600)   # 10 reports / hour
     conn = db()
     if pid:
         conn.execute("UPDATE posts SET report_count=report_count+1 WHERE id=?", (pid,))
@@ -259,13 +339,15 @@ def report(slug=None, tid=None, pid=None):
 @app.route("/admin/login", methods=["GET", "POST"])
 def admin_login():
     if request.method == "POST":
-        h = hashlib.sha256(request.form["password"].encode()).hexdigest()
+        limited("login", 5, 900)   # 5 attempts / 15 min
+        from werkzeug.security import check_password_hash
         conn = db()
-        row = conn.execute("SELECT 1 FROM admins WHERE username=? AND password_hash=?",
-                           (request.form["username"], h)).fetchone()
+        row = conn.execute("SELECT password_hash FROM admins WHERE username=?",
+                           (request.form["username"],)).fetchone()
         conn.close()
-        if row:
+        if row and check_password_hash(row["password_hash"], request.form["password"]):
             session["admin"] = request.form["username"]
+            session.permanent = True
             return redirect(request.args.get("next") or "/admin")
         flash("Bad credentials")
     return render_template_string(TPL_LOGIN)
@@ -340,7 +422,7 @@ def admin_thread(tid, action):
         t = conn.execute("SELECT * FROM threads WHERE id=?", (tid,)).fetchone()
         if t:
             conn.execute("INSERT INTO bans(post_type,post_id,ip_hash,reason,created_at) VALUES(?,?,?,?,?)",
-                         ("thread", tid, "", request.form.get("reason", "banned post"), now()))
+                         ("thread", tid, t["ip_hash"] or "", request.form.get("reason", "banned post"), now()))
             conn.execute("DELETE FROM threads WHERE id=?", (tid,))
     elif action == "clearreports": conn.execute("UPDATE threads SET report_count=0 WHERE id=?", (tid,))
     conn.commit(); conn.close()
@@ -354,8 +436,9 @@ def admin_post(pid, action):
     elif action == "unhide": conn.execute("UPDATE posts SET hidden=0 WHERE id=?", (pid,))
     elif action == "delete": conn.execute("DELETE FROM posts WHERE id=?", (pid,))
     elif action == "ban":
+        p = conn.execute("SELECT ip_hash FROM posts WHERE id=?", (pid,)).fetchone()
         conn.execute("INSERT INTO bans(post_type,post_id,ip_hash,reason,created_at) VALUES(?,?,?,?,?)",
-                     ("post", pid, "", request.form.get("reason", "banned post"), now()))
+                     ("post", pid, (p["ip_hash"] if p else "") or "", request.form.get("reason", "banned post"), now()))
         conn.execute("DELETE FROM posts WHERE id=?", (pid,))
     elif action == "clearreports": conn.execute("UPDATE posts SET report_count=0 WHERE id=?", (pid,))
     conn.commit(); conn.close()
